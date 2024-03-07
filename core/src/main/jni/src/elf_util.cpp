@@ -138,7 +138,7 @@ void ElfImg::parse(ElfW(Ehdr) *hdr)
                  auto *d_buf = reinterpret_cast<ElfW(Word) *>(((size_t) hdr) +
                                                              section_h->sh_offset);
                 //auto *d_buf = reinterpret_cast<ElfW(Word) *>(((size_t) header) +
-                                                             section_h->sh_offset);
+                //                                             section_h->sh_offset);
                 gnu_nbucket_ = d_buf[0];
                 gnu_symndx_ = d_buf[1];
                 gnu_bloom_size_ = d_buf[2];
