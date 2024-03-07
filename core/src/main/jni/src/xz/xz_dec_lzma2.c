@@ -1,5 +1,5 @@
 /*
- * Branch/Call/Jump (BCJ) filter decoders
+ * LZMA2 decoder
  *
  * Authors: Lasse Collin <lasse.collin@tukaani.org>
  *          Igor Pavlov <https://7-zip.org/>
@@ -9,614 +9,1336 @@
  */
 
 #include "xz/xz_private.h"
+#include "xz/xz_lzma2.h"
 
 /*
- * The rest of the file is inside this ifdef. It makes things a little more
- * convenient when building without support for any BCJ filters.
+ * Range decoder initialization eats the first five bytes of each LZMA chunk.
  */
-#ifdef XZ_DEC_BCJ
+#define RC_INIT_BYTES 5
 
-struct xz_dec_bcj {
-	/* Type of the BCJ filter being used */
-	enum {
-		BCJ_X86 = 4,        /* x86 or x86-64 */
-		BCJ_POWERPC = 5,    /* Big endian only */
-		BCJ_IA64 = 6,       /* Big or little endian */
-		BCJ_ARM = 7,        /* Little endian only */
-		BCJ_ARMTHUMB = 8,   /* Little endian only */
-		BCJ_SPARC = 9,      /* Big or little endian */
-		BCJ_ARM64 = 10      /* AArch64 */
-	} type;
+/*
+ * Minimum number of usable input buffer to safely decode one LZMA symbol.
+ * The worst case is that we decode 22 bits using probabilities and 26
+ * direct bits. This may decode at maximum of 20 bytes of input. However,
+ * lzma_main() does an extra normalization before returning, thus we
+ * need to put 21 here.
+ */
+#define LZMA_IN_REQUIRED 21
+
+/*
+ * Dictionary (history buffer)
+ *
+ * These are always true:
+ *    start <= pos <= full <= end
+ *    pos <= limit <= end
+ *
+ * In multi-call mode, also these are true:
+ *    end == size
+ *    size <= size_max
+ *    allocated <= size
+ *
+ * Most of these variables are size_t to support single-call mode,
+ * in which the dictionary variables address the actual output
+ * buffer directly.
+ */
+struct dictionary {
+	/* Beginning of the history buffer */
+	uint8_t *buf;
+
+	/* Old position in buf (before decoding more data) */
+	size_t start;
+
+	/* Position in buf */
+	size_t pos;
 
 	/*
-	 * Return value of the next filter in the chain. We need to preserve
-	 * this information across calls, because we must not call the next
-	 * filter anymore once it has returned XZ_STREAM_END.
+	 * How full dictionary is. This is used to detect corrupt input that
+	 * would read beyond the beginning of the uncompressed stream.
 	 */
-	enum xz_ret ret;
+	size_t full;
 
-	/* True if we are operating in single-call mode. */
-	bool single_call;
+	/* Write limit; we don't write to buf[limit] or later bytes. */
+	size_t limit;
 
 	/*
-	 * Absolute position relative to the beginning of the uncompressed
-	 * data (in a single .xz Block). We care only about the lowest 32
-	 * bits so this doesn't need to be uint64_t even with big files.
+	 * End of the dictionary buffer. In multi-call mode, this is
+	 * the same as the dictionary size. In single-call mode, this
+	 * indicates the size of the output buffer.
 	 */
-	uint32_t pos;
+	size_t end;
 
-	/* x86 filter state */
-	uint32_t x86_prev_mask;
+	/*
+	 * Size of the dictionary as specified in Block Header. This is used
+	 * together with "full" to detect corrupt input that would make us
+	 * read beyond the beginning of the uncompressed stream.
+	 */
+	uint32_t size;
 
-	/* Temporary space to hold the variables from struct xz_buf */
-	uint8_t *out;
-	size_t out_pos;
-	size_t out_size;
+	/*
+	 * Maximum allowed dictionary size in multi-call mode.
+	 * This is ignored in single-call mode.
+	 */
+	uint32_t size_max;
 
+	/*
+	 * Amount of memory currently allocated for the dictionary.
+	 * This is used only with XZ_DYNALLOC. (With XZ_PREALLOC,
+	 * size_max is always the same as the allocated size.)
+	 */
+	uint32_t allocated;
+
+	/* Operation mode */
+	enum xz_mode mode;
+};
+
+/* Range decoder */
+struct rc_dec {
+	uint32_t range;
+	uint32_t code;
+
+	/*
+	 * Number of initializing bytes remaining to be read
+	 * by rc_read_init().
+	 */
+	uint32_t init_bytes_left;
+
+	/*
+	 * Buffer from which we read our input. It can be either
+	 * temp.buf or the caller-provided input buffer.
+	 */
+	const uint8_t *in;
+	size_t in_pos;
+	size_t in_limit;
+};
+
+/* Probabilities for a length decoder. */
+struct lzma_len_dec {
+	/* Probability of match length being at least 10 */
+	uint16_t choice;
+
+	/* Probability of match length being at least 18 */
+	uint16_t choice2;
+
+	/* Probabilities for match lengths 2-9 */
+	uint16_t low[POS_STATES_MAX][LEN_LOW_SYMBOLS];
+
+	/* Probabilities for match lengths 10-17 */
+	uint16_t mid[POS_STATES_MAX][LEN_MID_SYMBOLS];
+
+	/* Probabilities for match lengths 18-273 */
+	uint16_t high[LEN_HIGH_SYMBOLS];
+};
+
+struct lzma_dec {
+	/* Distances of latest four matches */
+	uint32_t rep0;
+	uint32_t rep1;
+	uint32_t rep2;
+	uint32_t rep3;
+
+	/* Types of the most recently seen LZMA symbols */
+	enum lzma_state state;
+
+	/*
+	 * Length of a match. This is updated so that dict_repeat can
+	 * be called again to finish repeating the whole match.
+	 */
+	uint32_t len;
+
+	/*
+	 * LZMA properties or related bit masks (number of literal
+	 * context bits, a mask derived from the number of literal
+	 * position bits, and a mask derived from the number
+	 * position bits)
+	 */
+	uint32_t lc;
+	uint32_t literal_pos_mask; /* (1 << lp) - 1 */
+	uint32_t pos_mask;         /* (1 << pb) - 1 */
+
+	/* If 1, it's a match. Otherwise it's a single 8-bit literal. */
+	uint16_t is_match[STATES][POS_STATES_MAX];
+
+	/* If 1, it's a repeated match. The distance is one of rep0 .. rep3. */
+	uint16_t is_rep[STATES];
+
+	/*
+	 * If 0, distance of a repeated match is rep0.
+	 * Otherwise check is_rep1.
+	 */
+	uint16_t is_rep0[STATES];
+
+	/*
+	 * If 0, distance of a repeated match is rep1.
+	 * Otherwise check is_rep2.
+	 */
+	uint16_t is_rep1[STATES];
+
+	/* If 0, distance of a repeated match is rep2. Otherwise it is rep3. */
+	uint16_t is_rep2[STATES];
+
+	/*
+	 * If 1, the repeated match has length of one byte. Otherwise
+	 * the length is decoded from rep_len_decoder.
+	 */
+	uint16_t is_rep0_long[STATES][POS_STATES_MAX];
+
+	/*
+	 * Probability tree for the highest two bits of the match
+	 * distance. There is a separate probability tree for match
+	 * lengths of 2 (i.e. MATCH_LEN_MIN), 3, 4, and [5, 273].
+	 */
+	uint16_t dist_slot[DIST_STATES][DIST_SLOTS];
+
+	/*
+	 * Probility trees for additional bits for match distance
+	 * when the distance is in the range [4, 127].
+	 */
+	uint16_t dist_special[FULL_DISTANCES - DIST_MODEL_END];
+
+	/*
+	 * Probability tree for the lowest four bits of a match
+	 * distance that is equal to or greater than 128.
+	 */
+	uint16_t dist_align[ALIGN_SIZE];
+
+	/* Length of a normal match */
+	struct lzma_len_dec match_len_dec;
+
+	/* Length of a repeated match */
+	struct lzma_len_dec rep_len_dec;
+
+	/* Probabilities of literals */
+	uint16_t literal[LITERAL_CODERS_MAX][LITERAL_CODER_SIZE];
+};
+
+struct lzma2_dec {
+	/* Position in xz_dec_lzma2_run(). */
+	enum lzma2_seq {
+		SEQ_CONTROL,
+		SEQ_UNCOMPRESSED_1,
+		SEQ_UNCOMPRESSED_2,
+		SEQ_COMPRESSED_0,
+		SEQ_COMPRESSED_1,
+		SEQ_PROPERTIES,
+		SEQ_LZMA_PREPARE,
+		SEQ_LZMA_RUN,
+		SEQ_COPY
+	} sequence;
+
+	/* Next position after decoding the compressed size of the chunk. */
+	enum lzma2_seq next_sequence;
+
+	/* Uncompressed size of LZMA chunk (2 MiB at maximum) */
+	uint32_t uncompressed;
+
+	/*
+	 * Compressed size of LZMA chunk or compressed/uncompressed
+	 * size of uncompressed chunk (64 KiB at maximum)
+	 */
+	uint32_t compressed;
+
+	/*
+	 * True if dictionary reset is needed. This is false before
+	 * the first chunk (LZMA or uncompressed).
+	 */
+	bool need_dict_reset;
+
+	/*
+	 * True if new LZMA properties are needed. This is false
+	 * before the first LZMA chunk.
+	 */
+	bool need_props;
+
+#ifdef XZ_DEC_MICROLZMA
+	bool pedantic_microlzma;
+#endif
+};
+
+struct xz_dec_lzma2 {
+	/*
+	 * The order below is important on x86 to reduce code size and
+	 * it shouldn't hurt on other platforms. Everything up to and
+	 * including lzma.pos_mask are in the first 128 bytes on x86-32,
+	 * which allows using smaller instructions to access those
+	 * variables. On x86-64, fewer variables fit into the first 128
+	 * bytes, but this is still the best order without sacrificing
+	 * the readability by splitting the structures.
+	 */
+	struct rc_dec rc;
+	struct dictionary dict;
+	struct lzma2_dec lzma2;
+	struct lzma_dec lzma;
+
+	/*
+	 * Temporary buffer which holds small number of input bytes between
+	 * decoder calls. See lzma2_lzma() for details.
+	 */
 	struct {
-		/* Amount of already filtered data in the beginning of buf */
-		size_t filtered;
-
-		/* Total amount of data currently stored in buf  */
-		size_t size;
-
-		/*
-		 * Buffer to hold a mix of filtered and unfiltered data. This
-		 * needs to be big enough to hold Alignment + 2 * Look-ahead:
-		 *
-		 * Type         Alignment   Look-ahead
-		 * x86              1           4
-		 * PowerPC          4           0
-		 * IA-64           16           0
-		 * ARM              4           0
-		 * ARM-Thumb        2           2
-		 * SPARC            4           0
-		 */
-		uint8_t buf[16];
+		uint32_t size;
+		uint8_t buf[3 * LZMA_IN_REQUIRED];
 	} temp;
 };
 
-#ifdef XZ_DEC_X86
-/*
- * This is used to test the most significant byte of a memory address
- * in an x86 instruction.
- */
-static inline int bcj_x86_test_msbyte(uint8_t b)
-{
-	return b == 0x00 || b == 0xFF;
-}
-
-static size_t bcj_x86(struct xz_dec_bcj *s, uint8_t *buf, size_t size)
-{
-	static const bool mask_to_allowed_status[8]
-		= { true, true, true, false, true, false, false, false };
-
-	static const uint8_t mask_to_bit_num[8] = { 0, 1, 2, 2, 3, 3, 3, 3 };
-
-	size_t i;
-	size_t prev_pos = (size_t)-1;
-	uint32_t prev_mask = s->x86_prev_mask;
-	uint32_t src;
-	uint32_t dest;
-	uint32_t j;
-	uint8_t b;
-
-	if (size <= 4)
-		return 0;
-
-	size -= 4;
-	for (i = 0; i < size; ++i) {
-		if ((buf[i] & 0xFE) != 0xE8)
-			continue;
-
-		prev_pos = i - prev_pos;
-		if (prev_pos > 3) {
-			prev_mask = 0;
-		} else {
-			prev_mask = (prev_mask << (prev_pos - 1)) & 7;
-			if (prev_mask != 0) {
-				b = buf[i + 4 - mask_to_bit_num[prev_mask]];
-				if (!mask_to_allowed_status[prev_mask]
-						|| bcj_x86_test_msbyte(b)) {
-					prev_pos = i;
-					prev_mask = (prev_mask << 1) | 1;
-					continue;
-				}
-			}
-		}
-
-		prev_pos = i;
-
-		if (bcj_x86_test_msbyte(buf[i + 4])) {
-			src = get_unaligned_le32(buf + i + 1);
-			while (true) {
-				dest = src - (s->pos + (uint32_t)i + 5);
-				if (prev_mask == 0)
-					break;
-
-				j = mask_to_bit_num[prev_mask] * 8;
-				b = (uint8_t)(dest >> (24 - j));
-				if (!bcj_x86_test_msbyte(b))
-					break;
-
-				src = dest ^ (((uint32_t)1 << (32 - j)) - 1);
-			}
-
-			dest &= 0x01FFFFFF;
-			dest |= (uint32_t)0 - (dest & 0x01000000);
-			put_unaligned_le32(dest, buf + i + 1);
-			i += 4;
-		} else {
-			prev_mask = (prev_mask << 1) | 1;
-		}
-	}
-
-	prev_pos = i - prev_pos;
-	s->x86_prev_mask = prev_pos > 3 ? 0 : prev_mask << (prev_pos - 1);
-	return i;
-}
-#endif
-
-#ifdef XZ_DEC_POWERPC
-static size_t bcj_powerpc(struct xz_dec_bcj *s, uint8_t *buf, size_t size)
-{
-	size_t i;
-	uint32_t instr;
-
-	for (i = 0; i + 4 <= size; i += 4) {
-		instr = get_unaligned_be32(buf + i);
-		if ((instr & 0xFC000003) == 0x48000001) {
-			instr &= 0x03FFFFFC;
-			instr -= s->pos + (uint32_t)i;
-			instr &= 0x03FFFFFC;
-			instr |= 0x48000001;
-			put_unaligned_be32(instr, buf + i);
-		}
-	}
-
-	return i;
-}
-#endif
-
-#ifdef XZ_DEC_IA64
-static size_t bcj_ia64(struct xz_dec_bcj *s, uint8_t *buf, size_t size)
-{
-	static const uint8_t branch_table[32] = {
-		0, 0, 0, 0, 0, 0, 0, 0,
-		0, 0, 0, 0, 0, 0, 0, 0,
-		4, 4, 6, 6, 0, 0, 7, 7,
-		4, 4, 0, 0, 4, 4, 0, 0
-	};
-
-	/*
-	 * The local variables take a little bit stack space, but it's less
-	 * than what LZMA2 decoder takes, so it doesn't make sense to reduce
-	 * stack usage here without doing that for the LZMA2 decoder too.
-	 */
-
-	/* Loop counters */
-	size_t i;
-	size_t j;
-
-	/* Instruction slot (0, 1, or 2) in the 128-bit instruction word */
-	uint32_t slot;
-
-	/* Bitwise offset of the instruction indicated by slot */
-	uint32_t bit_pos;
-
-	/* bit_pos split into byte and bit parts */
-	uint32_t byte_pos;
-	uint32_t bit_res;
-
-	/* Address part of an instruction */
-	uint32_t addr;
-
-	/* Mask used to detect which instructions to convert */
-	uint32_t mask;
-
-	/* 41-bit instruction stored somewhere in the lowest 48 bits */
-	uint64_t instr;
-
-	/* Instruction normalized with bit_res for easier manipulation */
-	uint64_t norm;
-
-	for (i = 0; i + 16 <= size; i += 16) {
-		mask = branch_table[buf[i] & 0x1F];
-		for (slot = 0, bit_pos = 5; slot < 3; ++slot, bit_pos += 41) {
-			if (((mask >> slot) & 1) == 0)
-				continue;
-
-			byte_pos = bit_pos >> 3;
-			bit_res = bit_pos & 7;
-			instr = 0;
-			for (j = 0; j < 6; ++j)
-				instr |= (uint64_t)(buf[i + j + byte_pos])
-						<< (8 * j);
-
-			norm = instr >> bit_res;
-
-			if (((norm >> 37) & 0x0F) == 0x05
-					&& ((norm >> 9) & 0x07) == 0) {
-				addr = (norm >> 13) & 0x0FFFFF;
-				addr |= ((uint32_t)(norm >> 36) & 1) << 20;
-				addr <<= 4;
-				addr -= s->pos + (uint32_t)i;
-				addr >>= 4;
-
-				norm &= ~((uint64_t)0x8FFFFF << 13);
-				norm |= (uint64_t)(addr & 0x0FFFFF) << 13;
-				norm |= (uint64_t)(addr & 0x100000)
-						<< (36 - 20);
-
-				instr &= (1 << bit_res) - 1;
-				instr |= norm << bit_res;
-
-				for (j = 0; j < 6; j++)
-					buf[i + j + byte_pos]
-						= (uint8_t)(instr >> (8 * j));
-			}
-		}
-	}
-
-	return i;
-}
-#endif
-
-#ifdef XZ_DEC_ARM
-static size_t bcj_arm(struct xz_dec_bcj *s, uint8_t *buf, size_t size)
-{
-	size_t i;
-	uint32_t addr;
-
-	for (i = 0; i + 4 <= size; i += 4) {
-		if (buf[i + 3] == 0xEB) {
-			addr = (uint32_t)buf[i] | ((uint32_t)buf[i + 1] << 8)
-					| ((uint32_t)buf[i + 2] << 16);
-			addr <<= 2;
-			addr -= s->pos + (uint32_t)i + 8;
-			addr >>= 2;
-			buf[i] = (uint8_t)addr;
-			buf[i + 1] = (uint8_t)(addr >> 8);
-			buf[i + 2] = (uint8_t)(addr >> 16);
-		}
-	}
-
-	return i;
-}
-#endif
-
-#ifdef XZ_DEC_ARMTHUMB
-static size_t bcj_armthumb(struct xz_dec_bcj *s, uint8_t *buf, size_t size)
-{
-	size_t i;
-	uint32_t addr;
-
-	for (i = 0; i + 4 <= size; i += 2) {
-		if ((buf[i + 1] & 0xF8) == 0xF0
-				&& (buf[i + 3] & 0xF8) == 0xF8) {
-			addr = (((uint32_t)buf[i + 1] & 0x07) << 19)
-					| ((uint32_t)buf[i] << 11)
-					| (((uint32_t)buf[i + 3] & 0x07) << 8)
-					| (uint32_t)buf[i + 2];
-			addr <<= 1;
-			addr -= s->pos + (uint32_t)i + 4;
-			addr >>= 1;
-			buf[i + 1] = (uint8_t)(0xF0 | ((addr >> 19) & 0x07));
-			buf[i] = (uint8_t)(addr >> 11);
-			buf[i + 3] = (uint8_t)(0xF8 | ((addr >> 8) & 0x07));
-			buf[i + 2] = (uint8_t)addr;
-			i += 2;
-		}
-	}
-
-	return i;
-}
-#endif
-
-#ifdef XZ_DEC_SPARC
-static size_t bcj_sparc(struct xz_dec_bcj *s, uint8_t *buf, size_t size)
-{
-	size_t i;
-	uint32_t instr;
-
-	for (i = 0; i + 4 <= size; i += 4) {
-		instr = get_unaligned_be32(buf + i);
-		if ((instr >> 22) == 0x100 || (instr >> 22) == 0x1FF) {
-			instr <<= 2;
-			instr -= s->pos + (uint32_t)i;
-			instr >>= 2;
-			instr = ((uint32_t)0x40000000 - (instr & 0x400000))
-					| 0x40000000 | (instr & 0x3FFFFF);
-			put_unaligned_be32(instr, buf + i);
-		}
-	}
-
-	return i;
-}
-#endif
-
-#ifdef XZ_DEC_ARM64
-static size_t bcj_arm64(struct xz_dec_bcj *s, uint8_t *buf, size_t size)
-{
-	size_t i;
-	uint32_t instr;
-	uint32_t addr;
-
-	for (i = 0; i + 4 <= size; i += 4) {
-		instr = get_unaligned_le32(buf + i);
-
-		if ((instr >> 26) == 0x25) {
-			/* BL instruction */
-			addr = instr - ((s->pos + (uint32_t)i) >> 2);
-			instr = 0x94000000 | (addr & 0x03FFFFFF);
-			put_unaligned_le32(instr, buf + i);
-
-		} else if ((instr & 0x9F000000) == 0x90000000) {
-			/* ADRP instruction */
-			addr = ((instr >> 29) & 3) | ((instr >> 3) & 0x1FFFFC);
-
-			/* Only convert values in the range +/-512 MiB. */
-			if ((addr + 0x020000) & 0x1C0000)
-				continue;
-
-			addr -= (s->pos + (uint32_t)i) >> 12;
-
-			instr &= 0x9000001F;
-			instr |= (addr & 3) << 29;
-			instr |= (addr & 0x03FFFC) << 3;
-			instr |= (0U - (addr & 0x020000)) & 0xE00000;
-
-			put_unaligned_le32(instr, buf + i);
-		}
-	}
-
-	return i;
-}
-#endif
+/**************
+ * Dictionary *
+ **************/
 
 /*
- * Apply the selected BCJ filter. Update *pos and s->pos to match the amount
- * of data that got filtered.
- *
- * NOTE: This is implemented as a switch statement to avoid using function
- * pointers, which could be problematic in the kernel boot code, which must
- * avoid pointers to static data (at least on x86).
+ * Reset the dictionary state. When in single-call mode, set up the beginning
+ * of the dictionary to point to the actual output buffer.
  */
-static void bcj_apply(struct xz_dec_bcj *s,
-		      uint8_t *buf, size_t *pos, size_t size)
+static void dict_reset(struct dictionary *dict, struct xz_buf *b)
 {
-	size_t filtered;
-
-	buf += *pos;
-	size -= *pos;
-
-	switch (s->type) {
-#ifdef XZ_DEC_X86
-	case BCJ_X86:
-		filtered = bcj_x86(s, buf, size);
-		break;
-#endif
-#ifdef XZ_DEC_POWERPC
-	case BCJ_POWERPC:
-		filtered = bcj_powerpc(s, buf, size);
-		break;
-#endif
-#ifdef XZ_DEC_IA64
-	case BCJ_IA64:
-		filtered = bcj_ia64(s, buf, size);
-		break;
-#endif
-#ifdef XZ_DEC_ARM
-	case BCJ_ARM:
-		filtered = bcj_arm(s, buf, size);
-		break;
-#endif
-#ifdef XZ_DEC_ARMTHUMB
-	case BCJ_ARMTHUMB:
-		filtered = bcj_armthumb(s, buf, size);
-		break;
-#endif
-#ifdef XZ_DEC_SPARC
-	case BCJ_SPARC:
-		filtered = bcj_sparc(s, buf, size);
-		break;
-#endif
-#ifdef XZ_DEC_ARM64
-	case BCJ_ARM64:
-		filtered = bcj_arm64(s, buf, size);
-		break;
-#endif
-	default:
-		/* Never reached but silence compiler warnings. */
-		filtered = 0;
-		break;
+	if (DEC_IS_SINGLE(dict->mode)) {
+		dict->buf = b->out + b->out_pos;
+		dict->end = b->out_size - b->out_pos;
 	}
 
-	*pos += filtered;
-	s->pos += filtered;
+	dict->start = 0;
+	dict->pos = 0;
+	dict->limit = 0;
+	dict->full = 0;
+}
+
+/* Set dictionary write limit */
+static void dict_limit(struct dictionary *dict, size_t out_max)
+{
+	if (dict->end - dict->pos <= out_max)
+		dict->limit = dict->end;
+	else
+		dict->limit = dict->pos + out_max;
+}
+
+/* Return true if at least one byte can be written into the dictionary. */
+static inline bool dict_has_space(const struct dictionary *dict)
+{
+	return dict->pos < dict->limit;
 }
 
 /*
- * Flush pending filtered data from temp to the output buffer.
- * Move the remaining mixture of possibly filtered and unfiltered
- * data to the beginning of temp.
+ * Get a byte from the dictionary at the given distance. The distance is
+ * assumed to valid, or as a special case, zero when the dictionary is
+ * still empty. This special case is needed for single-call decoding to
+ * avoid writing a '\0' to the end of the destination buffer.
  */
-static void bcj_flush(struct xz_dec_bcj *s, struct xz_buf *b)
+static inline uint32_t dict_get(const struct dictionary *dict, uint32_t dist)
+{
+	size_t offset = dict->pos - dist - 1;
+
+	if (dist >= dict->pos)
+		offset += dict->end;
+
+	return dict->full > 0 ? dict->buf[offset] : 0;
+}
+
+/*
+ * Put one byte into the dictionary. It is assumed that there is space for it.
+ */
+static inline void dict_put(struct dictionary *dict, uint8_t byte)
+{
+	dict->buf[dict->pos++] = byte;
+
+	if (dict->full < dict->pos)
+		dict->full = dict->pos;
+}
+
+/*
+ * Repeat given number of bytes from the given distance. If the distance is
+ * invalid, false is returned. On success, true is returned and *len is
+ * updated to indicate how many bytes were left to be repeated.
+ */
+static bool dict_repeat(struct dictionary *dict, uint32_t *len, uint32_t dist)
+{
+	size_t back;
+	uint32_t left;
+
+	if (dist >= dict->full || dist >= dict->size)
+		return false;
+
+	left = min_t(size_t, dict->limit - dict->pos, *len);
+	*len -= left;
+
+	back = dict->pos - dist - 1;
+	if (dist >= dict->pos)
+		back += dict->end;
+
+	do {
+		dict->buf[dict->pos++] = dict->buf[back++];
+		if (back == dict->end)
+			back = 0;
+	} while (--left > 0);
+
+	if (dict->full < dict->pos)
+		dict->full = dict->pos;
+
+	return true;
+}
+
+/* Copy uncompressed data as is from input to dictionary and output buffers. */
+static void dict_uncompressed(struct dictionary *dict, struct xz_buf *b,
+			      uint32_t *left)
 {
 	size_t copy_size;
 
-	copy_size = min_t(size_t, s->temp.filtered, b->out_size - b->out_pos);
-	memcpy(b->out + b->out_pos, s->temp.buf, copy_size);
-	b->out_pos += copy_size;
+	while (*left > 0 && b->in_pos < b->in_size
+			&& b->out_pos < b->out_size) {
+		copy_size = min(b->in_size - b->in_pos,
+				b->out_size - b->out_pos);
+		if (copy_size > dict->end - dict->pos)
+			copy_size = dict->end - dict->pos;
+		if (copy_size > *left)
+			copy_size = *left;
 
-	s->temp.filtered -= copy_size;
-	s->temp.size -= copy_size;
-	memmove(s->temp.buf, s->temp.buf + copy_size, s->temp.size);
+		*left -= copy_size;
+
+		/*
+		 * If doing in-place decompression in single-call mode and the
+		 * uncompressed size of the file is larger than the caller
+		 * thought (i.e. it is invalid input!), the buffers below may
+		 * overlap and cause undefined behavior with memcpy().
+		 * With valid inputs memcpy() would be fine here.
+		 */
+		memmove(dict->buf + dict->pos, b->in + b->in_pos, copy_size);
+		dict->pos += copy_size;
+
+		if (dict->full < dict->pos)
+			dict->full = dict->pos;
+
+		if (DEC_IS_MULTI(dict->mode)) {
+			if (dict->pos == dict->end)
+				dict->pos = 0;
+
+			/*
+			 * Like above but for multi-call mode: use memmove()
+			 * to avoid undefined behavior with invalid input.
+			 */
+			memmove(b->out + b->out_pos, b->in + b->in_pos,
+					copy_size);
+		}
+
+		dict->start = dict->pos;
+
+		b->out_pos += copy_size;
+		b->in_pos += copy_size;
+	}
+}
+
+#ifdef XZ_DEC_MICROLZMA
+#	define DICT_FLUSH_SUPPORTS_SKIPPING true
+#else
+#	define DICT_FLUSH_SUPPORTS_SKIPPING false
+#endif
+
+/*
+ * Flush pending data from dictionary to b->out. It is assumed that there is
+ * enough space in b->out. This is guaranteed because caller uses dict_limit()
+ * before decoding data into the dictionary.
+ */
+static uint32_t dict_flush(struct dictionary *dict, struct xz_buf *b)
+{
+	size_t copy_size = dict->pos - dict->start;
+
+	if (DEC_IS_MULTI(dict->mode)) {
+		if (dict->pos == dict->end)
+			dict->pos = 0;
+
+		/*
+		 * These buffers cannot overlap even if doing in-place
+		 * decompression because in multi-call mode dict->buf
+		 * has been allocated by us in this file; it's not
+		 * provided by the caller like in single-call mode.
+		 *
+		 * With MicroLZMA, b->out can be NULL to skip bytes that
+		 * the caller doesn't need. This cannot be done with XZ
+		 * because it would break BCJ filters.
+		 */
+		if (!DICT_FLUSH_SUPPORTS_SKIPPING || b->out != NULL)
+			memcpy(b->out + b->out_pos, dict->buf + dict->start,
+					copy_size);
+	}
+
+	dict->start = dict->pos;
+	b->out_pos += copy_size;
+	return copy_size;
+}
+
+/*****************
+ * Range decoder *
+ *****************/
+
+/* Reset the range decoder. */
+static void rc_reset(struct rc_dec *rc)
+{
+	rc->range = (uint32_t)-1;
+	rc->code = 0;
+	rc->init_bytes_left = RC_INIT_BYTES;
 }
 
 /*
- * The BCJ filter functions are primitive in sense that they process the
- * data in chunks of 1-16 bytes. To hide this issue, this function does
- * some buffering.
+ * Read the first five initial bytes into rc->code if they haven't been
+ * read already. (Yes, the first byte gets completely ignored.)
  */
-XZ_EXTERN enum xz_ret xz_dec_bcj_run(struct xz_dec_bcj *s,
-				     struct xz_dec_lzma2 *lzma2,
-				     struct xz_buf *b)
+static bool rc_read_init(struct rc_dec *rc, struct xz_buf *b)
 {
-	size_t out_start;
+	while (rc->init_bytes_left > 0) {
+		if (b->in_pos == b->in_size)
+			return false;
 
-	/*
-	 * Flush pending already filtered data to the output buffer. Return
-	 * immediately if we couldn't flush everything, or if the next
-	 * filter in the chain had already returned XZ_STREAM_END.
-	 */
-	if (s->temp.filtered > 0) {
-		bcj_flush(s, b);
-		if (s->temp.filtered > 0)
-			return XZ_OK;
-
-		if (s->ret == XZ_STREAM_END)
-			return XZ_STREAM_END;
+		rc->code = (rc->code << 8) + b->in[b->in_pos++];
+		--rc->init_bytes_left;
 	}
 
-	/*
-	 * If we have more output space than what is currently pending in
-	 * temp, copy the unfiltered data from temp to the output buffer
-	 * and try to fill the output buffer by decoding more data from the
-	 * next filter in the chain. Apply the BCJ filter on the new data
-	 * in the output buffer. If everything cannot be filtered, copy it
-	 * to temp and rewind the output buffer position accordingly.
-	 *
-	 * This needs to be always run when temp.size == 0 to handle a special
-	 * case where the output buffer is full and the next filter has no
-	 * more output coming but hasn't returned XZ_STREAM_END yet.
-	 */
-	if (s->temp.size < b->out_size - b->out_pos || s->temp.size == 0) {
-		out_start = b->out_pos;
-		memcpy(b->out + b->out_pos, s->temp.buf, s->temp.size);
-		b->out_pos += s->temp.size;
-
-		s->ret = xz_dec_lzma2_run(lzma2, b);
-		if (s->ret != XZ_STREAM_END
-				&& (s->ret != XZ_OK || s->single_call))
-			return s->ret;
-
-		bcj_apply(s, b->out, &out_start, b->out_pos);
-
-		/*
-		 * As an exception, if the next filter returned XZ_STREAM_END,
-		 * we can do that too, since the last few bytes that remain
-		 * unfiltered are meant to remain unfiltered.
-		 */
-		if (s->ret == XZ_STREAM_END)
-			return XZ_STREAM_END;
-
-		s->temp.size = b->out_pos - out_start;
-		b->out_pos -= s->temp.size;
-		memcpy(s->temp.buf, b->out + b->out_pos, s->temp.size);
-
-		/*
-		 * If there wasn't enough input to the next filter to fill
-		 * the output buffer with unfiltered data, there's no point
-		 * to try decoding more data to temp.
-		 */
-		if (b->out_pos + s->temp.size < b->out_size)
-			return XZ_OK;
-	}
-
-	/*
-	 * We have unfiltered data in temp. If the output buffer isn't full
-	 * yet, try to fill the temp buffer by decoding more data from the
-	 * next filter. Apply the BCJ filter on temp. Then we hopefully can
-	 * fill the actual output buffer by copying filtered data from temp.
-	 * A mix of filtered and unfiltered data may be left in temp; it will
-	 * be taken care on the next call to this function.
-	 */
-	if (b->out_pos < b->out_size) {
-		/* Make b->out{,_pos,_size} temporarily point to s->temp. */
-		s->out = b->out;
-		s->out_pos = b->out_pos;
-		s->out_size = b->out_size;
-		b->out = s->temp.buf;
-		b->out_pos = s->temp.size;
-		b->out_size = sizeof(s->temp.buf);
-
-		s->ret = xz_dec_lzma2_run(lzma2, b);
-
-		s->temp.size = b->out_pos;
-		b->out = s->out;
-		b->out_pos = s->out_pos;
-		b->out_size = s->out_size;
-
-		if (s->ret != XZ_OK && s->ret != XZ_STREAM_END)
-			return s->ret;
-
-		bcj_apply(s, s->temp.buf, &s->temp.filtered, s->temp.size);
-
-		/*
-		 * If the next filter returned XZ_STREAM_END, we mark that
-		 * everything is filtered, since the last unfiltered bytes
-		 * of the stream are meant to be left as is.
-		 */
-		if (s->ret == XZ_STREAM_END)
-			s->temp.filtered = s->temp.size;
-
-		bcj_flush(s, b);
-		if (s->temp.filtered > 0)
-			return XZ_OK;
-	}
-
-	return s->ret;
+	return true;
 }
 
-XZ_EXTERN struct xz_dec_bcj *xz_dec_bcj_create(bool single_call)
+/* Return true if there may not be enough input for the next decoding loop. */
+static inline bool rc_limit_exceeded(const struct rc_dec *rc)
 {
-	struct xz_dec_bcj *s = kmalloc(sizeof(*s), GFP_KERNEL);
-	if (s != NULL)
-		s->single_call = single_call;
+	return rc->in_pos > rc->in_limit;
+}
+
+/*
+ * Return true if it is possible (from point of view of range decoder) that
+ * we have reached the end of the LZMA chunk.
+ */
+static inline bool rc_is_finished(const struct rc_dec *rc)
+{
+	return rc->code == 0;
+}
+
+/* Read the next input byte if needed. */
+static __always_inline void rc_normalize(struct rc_dec *rc)
+{
+	if (rc->range < RC_TOP_VALUE) {
+		rc->range <<= RC_SHIFT_BITS;
+		rc->code = (rc->code << RC_SHIFT_BITS) + rc->in[rc->in_pos++];
+	}
+}
+
+/*
+ * Decode one bit. In some versions, this function has been split in three
+ * functions so that the compiler is supposed to be able to more easily avoid
+ * an extra branch. In this particular version of the LZMA decoder, this
+ * doesn't seem to be a good idea (tested with GCC 3.3.6, 3.4.6, and 4.3.3
+ * on x86). Using a non-split version results in nicer looking code too.
+ *
+ * NOTE: This must return an int. Do not make it return a bool or the speed
+ * of the code generated by GCC 3.x decreases 10-15 %. (GCC 4.3 doesn't care,
+ * and it generates 10-20 % faster code than GCC 3.x from this file anyway.)
+ */
+static __always_inline int rc_bit(struct rc_dec *rc, uint16_t *prob)
+{
+	uint32_t bound;
+	int bit;
+
+	rc_normalize(rc);
+	bound = (rc->range >> RC_BIT_MODEL_TOTAL_BITS) * *prob;
+	if (rc->code < bound) {
+		rc->range = bound;
+		*prob += (RC_BIT_MODEL_TOTAL - *prob) >> RC_MOVE_BITS;
+		bit = 0;
+	} else {
+		rc->range -= bound;
+		rc->code -= bound;
+		*prob -= *prob >> RC_MOVE_BITS;
+		bit = 1;
+	}
+
+	return bit;
+}
+
+/* Decode a bittree starting from the most significant bit. */
+static __always_inline uint32_t rc_bittree(struct rc_dec *rc,
+					   uint16_t *probs, uint32_t limit)
+{
+	uint32_t symbol = 1;
+
+	do {
+		if (rc_bit(rc, &probs[symbol]))
+			symbol = (symbol << 1) + 1;
+		else
+			symbol <<= 1;
+	} while (symbol < limit);
+
+	return symbol;
+}
+
+/* Decode a bittree starting from the least significant bit. */
+static __always_inline void rc_bittree_reverse(struct rc_dec *rc,
+					       uint16_t *probs,
+					       uint32_t *dest, uint32_t limit)
+{
+	uint32_t symbol = 1;
+	uint32_t i = 0;
+
+	do {
+		if (rc_bit(rc, &probs[symbol])) {
+			symbol = (symbol << 1) + 1;
+			*dest += 1 << i;
+		} else {
+			symbol <<= 1;
+		}
+	} while (++i < limit);
+}
+
+/* Decode direct bits (fixed fifty-fifty probability) */
+static inline void rc_direct(struct rc_dec *rc, uint32_t *dest, uint32_t limit)
+{
+	uint32_t mask;
+
+	do {
+		rc_normalize(rc);
+		rc->range >>= 1;
+		rc->code -= rc->range;
+		mask = (uint32_t)0 - (rc->code >> 31);
+		rc->code += rc->range & mask;
+		*dest = (*dest << 1) + (mask + 1);
+	} while (--limit > 0);
+}
+
+/********
+ * LZMA *
+ ********/
+
+/* Get pointer to literal coder probability array. */
+static uint16_t *lzma_literal_probs(struct xz_dec_lzma2 *s)
+{
+	uint32_t prev_byte = dict_get(&s->dict, 0);
+	uint32_t low = prev_byte >> (8 - s->lzma.lc);
+	uint32_t high = (s->dict.pos & s->lzma.literal_pos_mask) << s->lzma.lc;
+	return s->lzma.literal[low + high];
+}
+
+/* Decode a literal (one 8-bit byte) */
+static void lzma_literal(struct xz_dec_lzma2 *s)
+{
+	uint16_t *probs;
+	uint32_t symbol;
+	uint32_t match_byte;
+	uint32_t match_bit;
+	uint32_t offset;
+	uint32_t i;
+
+	probs = lzma_literal_probs(s);
+
+	if (lzma_state_is_literal(s->lzma.state)) {
+		symbol = rc_bittree(&s->rc, probs, 0x100);
+	} else {
+		symbol = 1;
+		match_byte = dict_get(&s->dict, s->lzma.rep0) << 1;
+		offset = 0x100;
+
+		do {
+			match_bit = match_byte & offset;
+			match_byte <<= 1;
+			i = offset + match_bit + symbol;
+
+			if (rc_bit(&s->rc, &probs[i])) {
+				symbol = (symbol << 1) + 1;
+				offset &= match_bit;
+			} else {
+				symbol <<= 1;
+				offset &= ~match_bit;
+			}
+		} while (symbol < 0x100);
+	}
+
+	dict_put(&s->dict, (uint8_t)symbol);
+	lzma_state_literal(&s->lzma.state);
+}
+
+/* Decode the length of the match into s->lzma.len. */
+static void lzma_len(struct xz_dec_lzma2 *s, struct lzma_len_dec *l,
+		     uint32_t pos_state)
+{
+	uint16_t *probs;
+	uint32_t limit;
+
+	if (!rc_bit(&s->rc, &l->choice)) {
+		probs = l->low[pos_state];
+		limit = LEN_LOW_SYMBOLS;
+		s->lzma.len = MATCH_LEN_MIN;
+	} else {
+		if (!rc_bit(&s->rc, &l->choice2)) {
+			probs = l->mid[pos_state];
+			limit = LEN_MID_SYMBOLS;
+			s->lzma.len = MATCH_LEN_MIN + LEN_LOW_SYMBOLS;
+		} else {
+			probs = l->high;
+			limit = LEN_HIGH_SYMBOLS;
+			s->lzma.len = MATCH_LEN_MIN + LEN_LOW_SYMBOLS
+					+ LEN_MID_SYMBOLS;
+		}
+	}
+
+	s->lzma.len += rc_bittree(&s->rc, probs, limit) - limit;
+}
+
+/* Decode a match. The distance will be stored in s->lzma.rep0. */
+static void lzma_match(struct xz_dec_lzma2 *s, uint32_t pos_state)
+{
+	uint16_t *probs;
+	uint32_t dist_slot;
+	uint32_t limit;
+
+	lzma_state_match(&s->lzma.state);
+
+	s->lzma.rep3 = s->lzma.rep2;
+	s->lzma.rep2 = s->lzma.rep1;
+	s->lzma.rep1 = s->lzma.rep0;
+
+	lzma_len(s, &s->lzma.match_len_dec, pos_state);
+
+	probs = s->lzma.dist_slot[lzma_get_dist_state(s->lzma.len)];
+	dist_slot = rc_bittree(&s->rc, probs, DIST_SLOTS) - DIST_SLOTS;
+
+	if (dist_slot < DIST_MODEL_START) {
+		s->lzma.rep0 = dist_slot;
+	} else {
+		limit = (dist_slot >> 1) - 1;
+		s->lzma.rep0 = 2 + (dist_slot & 1);
+
+		if (dist_slot < DIST_MODEL_END) {
+			s->lzma.rep0 <<= limit;
+			probs = s->lzma.dist_special + s->lzma.rep0
+					- dist_slot - 1;
+			rc_bittree_reverse(&s->rc, probs,
+					&s->lzma.rep0, limit);
+		} else {
+			rc_direct(&s->rc, &s->lzma.rep0, limit - ALIGN_BITS);
+			s->lzma.rep0 <<= ALIGN_BITS;
+			rc_bittree_reverse(&s->rc, s->lzma.dist_align,
+					&s->lzma.rep0, ALIGN_BITS);
+		}
+	}
+}
+
+/*
+ * Decode a repeated match. The distance is one of the four most recently
+ * seen matches. The distance will be stored in s->lzma.rep0.
+ */
+static void lzma_rep_match(struct xz_dec_lzma2 *s, uint32_t pos_state)
+{
+	uint32_t tmp;
+
+	if (!rc_bit(&s->rc, &s->lzma.is_rep0[s->lzma.state])) {
+		if (!rc_bit(&s->rc, &s->lzma.is_rep0_long[
+				s->lzma.state][pos_state])) {
+			lzma_state_short_rep(&s->lzma.state);
+			s->lzma.len = 1;
+			return;
+		}
+	} else {
+		if (!rc_bit(&s->rc, &s->lzma.is_rep1[s->lzma.state])) {
+			tmp = s->lzma.rep1;
+		} else {
+			if (!rc_bit(&s->rc, &s->lzma.is_rep2[s->lzma.state])) {
+				tmp = s->lzma.rep2;
+			} else {
+				tmp = s->lzma.rep3;
+				s->lzma.rep3 = s->lzma.rep2;
+			}
+
+			s->lzma.rep2 = s->lzma.rep1;
+		}
+
+		s->lzma.rep1 = s->lzma.rep0;
+		s->lzma.rep0 = tmp;
+	}
+
+	lzma_state_long_rep(&s->lzma.state);
+	lzma_len(s, &s->lzma.rep_len_dec, pos_state);
+}
+
+/* LZMA decoder core */
+static bool lzma_main(struct xz_dec_lzma2 *s)
+{
+	uint32_t pos_state;
+
+	/*
+	 * If the dictionary was reached during the previous call, try to
+	 * finish the possibly pending repeat in the dictionary.
+	 */
+	if (dict_has_space(&s->dict) && s->lzma.len > 0)
+		dict_repeat(&s->dict, &s->lzma.len, s->lzma.rep0);
+
+	/*
+	 * Decode more LZMA symbols. One iteration may consume up to
+	 * LZMA_IN_REQUIRED - 1 bytes.
+	 */
+	while (dict_has_space(&s->dict) && !rc_limit_exceeded(&s->rc)) {
+		pos_state = s->dict.pos & s->lzma.pos_mask;
+
+		if (!rc_bit(&s->rc, &s->lzma.is_match[
+				s->lzma.state][pos_state])) {
+			lzma_literal(s);
+		} else {
+			if (rc_bit(&s->rc, &s->lzma.is_rep[s->lzma.state]))
+				lzma_rep_match(s, pos_state);
+			else
+				lzma_match(s, pos_state);
+
+			if (!dict_repeat(&s->dict, &s->lzma.len, s->lzma.rep0))
+				return false;
+		}
+	}
+
+	/*
+	 * Having the range decoder always normalized when we are outside
+	 * this function makes it easier to correctly handle end of the chunk.
+	 */
+	rc_normalize(&s->rc);
+
+	return true;
+}
+
+/*
+ * Reset the LZMA decoder and range decoder state. Dictionary is not reset
+ * here, because LZMA state may be reset without resetting the dictionary.
+ */
+static void lzma_reset(struct xz_dec_lzma2 *s)
+{
+	uint16_t *probs;
+	size_t i;
+
+	s->lzma.state = STATE_LIT_LIT;
+	s->lzma.rep0 = 0;
+	s->lzma.rep1 = 0;
+	s->lzma.rep2 = 0;
+	s->lzma.rep3 = 0;
+	s->lzma.len = 0;
+
+	/*
+	 * All probabilities are initialized to the same value. This hack
+	 * makes the code smaller by avoiding a separate loop for each
+	 * probability array.
+	 *
+	 * This could be optimized so that only that part of literal
+	 * probabilities that are actually required. In the common case
+	 * we would write 12 KiB less.
+	 */
+	probs = s->lzma.is_match[0];
+	for (i = 0; i < PROBS_TOTAL; ++i)
+		probs[i] = RC_BIT_MODEL_TOTAL / 2;
+
+	rc_reset(&s->rc);
+}
+
+/*
+ * Decode and validate LZMA properties (lc/lp/pb) and calculate the bit masks
+ * from the decoded lp and pb values. On success, the LZMA decoder state is
+ * reset and true is returned.
+ */
+static bool lzma_props(struct xz_dec_lzma2 *s, uint8_t props)
+{
+	if (props > (4 * 5 + 4) * 9 + 8)
+		return false;
+
+	s->lzma.pos_mask = 0;
+	while (props >= 9 * 5) {
+		props -= 9 * 5;
+		++s->lzma.pos_mask;
+	}
+
+	s->lzma.pos_mask = (1 << s->lzma.pos_mask) - 1;
+
+	s->lzma.literal_pos_mask = 0;
+	while (props >= 9) {
+		props -= 9;
+		++s->lzma.literal_pos_mask;
+	}
+
+	s->lzma.lc = props;
+
+	if (s->lzma.lc + s->lzma.literal_pos_mask > 4)
+		return false;
+
+	s->lzma.literal_pos_mask = (1 << s->lzma.literal_pos_mask) - 1;
+
+	lzma_reset(s);
+
+	return true;
+}
+
+/*********
+ * LZMA2 *
+ *********/
+
+/*
+ * The LZMA decoder assumes that if the input limit (s->rc.in_limit) hasn't
+ * been exceeded, it is safe to read up to LZMA_IN_REQUIRED bytes. This
+ * wrapper function takes care of making the LZMA decoder's assumption safe.
+ *
+ * As long as there is plenty of input left to be decoded in the current LZMA
+ * chunk, we decode directly from the caller-supplied input buffer until
+ * there's LZMA_IN_REQUIRED bytes left. Those remaining bytes are copied into
+ * s->temp.buf, which (hopefully) gets filled on the next call to this
+ * function. We decode a few bytes from the temporary buffer so that we can
+ * continue decoding from the caller-supplied input buffer again.
+ */
+static bool lzma2_lzma(struct xz_dec_lzma2 *s, struct xz_buf *b)
+{
+	size_t in_avail;
+	uint32_t tmp;
+
+	in_avail = b->in_size - b->in_pos;
+	if (s->temp.size > 0 || s->lzma2.compressed == 0) {
+		tmp = 2 * LZMA_IN_REQUIRED - s->temp.size;
+		if (tmp > s->lzma2.compressed - s->temp.size)
+			tmp = s->lzma2.compressed - s->temp.size;
+		if (tmp > in_avail)
+			tmp = in_avail;
+
+		memcpy(s->temp.buf + s->temp.size, b->in + b->in_pos, tmp);
+
+		if (s->temp.size + tmp == s->lzma2.compressed) {
+			memzero(s->temp.buf + s->temp.size + tmp,
+					sizeof(s->temp.buf)
+						- s->temp.size - tmp);
+			s->rc.in_limit = s->temp.size + tmp;
+		} else if (s->temp.size + tmp < LZMA_IN_REQUIRED) {
+			s->temp.size += tmp;
+			b->in_pos += tmp;
+			return true;
+		} else {
+			s->rc.in_limit = s->temp.size + tmp - LZMA_IN_REQUIRED;
+		}
+
+		s->rc.in = s->temp.buf;
+		s->rc.in_pos = 0;
+
+		if (!lzma_main(s) || s->rc.in_pos > s->temp.size + tmp)
+			return false;
+
+		s->lzma2.compressed -= s->rc.in_pos;
+
+		if (s->rc.in_pos < s->temp.size) {
+			s->temp.size -= s->rc.in_pos;
+			memmove(s->temp.buf, s->temp.buf + s->rc.in_pos,
+					s->temp.size);
+			return true;
+		}
+
+		b->in_pos += s->rc.in_pos - s->temp.size;
+		s->temp.size = 0;
+	}
+
+	in_avail = b->in_size - b->in_pos;
+	if (in_avail >= LZMA_IN_REQUIRED) {
+		s->rc.in = b->in;
+		s->rc.in_pos = b->in_pos;
+
+		if (in_avail >= s->lzma2.compressed + LZMA_IN_REQUIRED)
+			s->rc.in_limit = b->in_pos + s->lzma2.compressed;
+		else
+			s->rc.in_limit = b->in_size - LZMA_IN_REQUIRED;
+
+		if (!lzma_main(s))
+			return false;
+
+		in_avail = s->rc.in_pos - b->in_pos;
+		if (in_avail > s->lzma2.compressed)
+			return false;
+
+		s->lzma2.compressed -= in_avail;
+		b->in_pos = s->rc.in_pos;
+	}
+
+	in_avail = b->in_size - b->in_pos;
+	if (in_avail < LZMA_IN_REQUIRED) {
+		if (in_avail > s->lzma2.compressed)
+			in_avail = s->lzma2.compressed;
+
+		memcpy(s->temp.buf, b->in + b->in_pos, in_avail);
+		s->temp.size = in_avail;
+		b->in_pos += in_avail;
+	}
+
+	return true;
+}
+
+/*
+ * Take care of the LZMA2 control layer, and forward the job of actual LZMA
+ * decoding or copying of uncompressed chunks to other functions.
+ */
+XZ_EXTERN enum xz_ret xz_dec_lzma2_run(struct xz_dec_lzma2 *s,
+				       struct xz_buf *b)
+{
+	uint32_t tmp;
+
+	while (b->in_pos < b->in_size || s->lzma2.sequence == SEQ_LZMA_RUN) {
+		switch (s->lzma2.sequence) {
+		case SEQ_CONTROL:
+			/*
+			 * LZMA2 control byte
+			 *
+			 * Exact values:
+			 *   0x00   End marker
+			 *   0x01   Dictionary reset followed by
+			 *          an uncompressed chunk
+			 *   0x02   Uncompressed chunk (no dictionary reset)
+			 *
+			 * Highest three bits (s->control & 0xE0):
+			 *   0xE0   Dictionary reset, new properties and state
+			 *          reset, followed by LZMA compressed chunk
+			 *   0xC0   New properties and state reset, followed
+			 *          by LZMA compressed chunk (no dictionary
+			 *          reset)
+			 *   0xA0   State reset using old properties,
+			 *          followed by LZMA compressed chunk (no
+			 *          dictionary reset)
+			 *   0x80   LZMA chunk (no dictionary or state reset)
+			 *
+			 * For LZMA compressed chunks, the lowest five bits
+			 * (s->control & 1F) are the highest bits of the
+			 * uncompressed size (bits 16-20).
+			 *
+			 * A new LZMA2 stream must begin with a dictionary
+			 * reset. The first LZMA chunk must set new
+			 * properties and reset the LZMA state.
+			 *
+			 * Values that don't match anything described above
+			 * are invalid and we return XZ_DATA_ERROR.
+			 */
+			tmp = b->in[b->in_pos++];
+
+			if (tmp == 0x00)
+				return XZ_STREAM_END;
+
+			if (tmp >= 0xE0 || tmp == 0x01) {
+				s->lzma2.need_props = true;
+				s->lzma2.need_dict_reset = false;
+				dict_reset(&s->dict, b);
+			} else if (s->lzma2.need_dict_reset) {
+				return XZ_DATA_ERROR;
+			}
+
+			if (tmp >= 0x80) {
+				s->lzma2.uncompressed = (tmp & 0x1F) << 16;
+				s->lzma2.sequence = SEQ_UNCOMPRESSED_1;
+
+				if (tmp >= 0xC0) {
+					/*
+					 * When there are new properties,
+					 * state reset is done at
+					 * SEQ_PROPERTIES.
+					 */
+					s->lzma2.need_props = false;
+					s->lzma2.next_sequence
+							= SEQ_PROPERTIES;
+
+				} else if (s->lzma2.need_props) {
+					return XZ_DATA_ERROR;
+
+				} else {
+					s->lzma2.next_sequence
+							= SEQ_LZMA_PREPARE;
+					if (tmp >= 0xA0)
+						lzma_reset(s);
+				}
+			} else {
+				if (tmp > 0x02)
+					return XZ_DATA_ERROR;
+
+				s->lzma2.sequence = SEQ_COMPRESSED_0;
+				s->lzma2.next_sequence = SEQ_COPY;
+			}
+
+			break;
+
+		case SEQ_UNCOMPRESSED_1:
+			s->lzma2.uncompressed
+					+= (uint32_t)b->in[b->in_pos++] << 8;
+			s->lzma2.sequence = SEQ_UNCOMPRESSED_2;
+			break;
+
+		case SEQ_UNCOMPRESSED_2:
+			s->lzma2.uncompressed
+					+= (uint32_t)b->in[b->in_pos++] + 1;
+			s->lzma2.sequence = SEQ_COMPRESSED_0;
+			break;
+
+		case SEQ_COMPRESSED_0:
+			s->lzma2.compressed
+					= (uint32_t)b->in[b->in_pos++] << 8;
+			s->lzma2.sequence = SEQ_COMPRESSED_1;
+			break;
+
+		case SEQ_COMPRESSED_1:
+			s->lzma2.compressed
+					+= (uint32_t)b->in[b->in_pos++] + 1;
+			s->lzma2.sequence = s->lzma2.next_sequence;
+			break;
+
+		case SEQ_PROPERTIES:
+			if (!lzma_props(s, b->in[b->in_pos++]))
+				return XZ_DATA_ERROR;
+
+			s->lzma2.sequence = SEQ_LZMA_PREPARE;
+
+		/* Fall through */
+
+		case SEQ_LZMA_PREPARE:
+			if (s->lzma2.compressed < RC_INIT_BYTES)
+				return XZ_DATA_ERROR;
+
+			if (!rc_read_init(&s->rc, b))
+				return XZ_OK;
+
+			s->lzma2.compressed -= RC_INIT_BYTES;
+			s->lzma2.sequence = SEQ_LZMA_RUN;
+
+		/* Fall through */
+
+		case SEQ_LZMA_RUN:
+			/*
+			 * Set dictionary limit to indicate how much we want
+			 * to be encoded at maximum. Decode new data into the
+			 * dictionary. Flush the new data from dictionary to
+			 * b->out. Check if we finished decoding this chunk.
+			 * In case the dictionary got full but we didn't fill
+			 * the output buffer yet, we may run this loop
+			 * multiple times without changing s->lzma2.sequence.
+			 */
+			dict_limit(&s->dict, min_t(size_t,
+					b->out_size - b->out_pos,
+					s->lzma2.uncompressed));
+			if (!lzma2_lzma(s, b))
+				return XZ_DATA_ERROR;
+
+			s->lzma2.uncompressed -= dict_flush(&s->dict, b);
+
+			if (s->lzma2.uncompressed == 0) {
+				if (s->lzma2.compressed > 0 || s->lzma.len > 0
+						|| !rc_is_finished(&s->rc))
+					return XZ_DATA_ERROR;
+
+				rc_reset(&s->rc);
+				s->lzma2.sequence = SEQ_CONTROL;
+
+			} else if (b->out_pos == b->out_size
+					|| (b->in_pos == b->in_size
+						&& s->temp.size
+						< s->lzma2.compressed)) {
+				return XZ_OK;
+			}
+
+			break;
+
+		case SEQ_COPY:
+			dict_uncompressed(&s->dict, b, &s->lzma2.compressed);
+			if (s->lzma2.compressed > 0)
+				return XZ_OK;
+
+			s->lzma2.sequence = SEQ_CONTROL;
+			break;
+		}
+	}
+
+	return XZ_OK;
+}
+
+XZ_EXTERN struct xz_dec_lzma2 *xz_dec_lzma2_create(enum xz_mode mode,
+						   uint32_t dict_max)
+{
+	struct xz_dec_lzma2 *s = kmalloc(sizeof(*s), GFP_KERNEL);
+	if (s == NULL)
+		return NULL;
+
+	s->dict.mode = mode;
+	s->dict.size_max = dict_max;
+
+	if (DEC_IS_PREALLOC(mode)) {
+		s->dict.buf = vmalloc(dict_max);
+		if (s->dict.buf == NULL) {
+			kfree(s);
+			return NULL;
+		}
+	} else if (DEC_IS_DYNALLOC(mode)) {
+		s->dict.buf = NULL;
+		s->dict.allocated = 0;
+	}
 
 	return s;
 }
 
-XZ_EXTERN enum xz_ret xz_dec_bcj_reset(struct xz_dec_bcj *s, uint8_t id)
+XZ_EXTERN enum xz_ret xz_dec_lzma2_reset(struct xz_dec_lzma2 *s, uint8_t props)
 {
-	switch (id) {
-#ifdef XZ_DEC_X86
-	case BCJ_X86:
-#endif
-#ifdef XZ_DEC_POWERPC
-	case BCJ_POWERPC:
-#endif
-#ifdef XZ_DEC_IA64
-	case BCJ_IA64:
-#endif
-#ifdef XZ_DEC_ARM
-	case BCJ_ARM:
-#endif
-#ifdef XZ_DEC_ARMTHUMB
-	case BCJ_ARMTHUMB:
-#endif
-#ifdef XZ_DEC_SPARC
-	case BCJ_SPARC:
-#endif
-#ifdef XZ_DEC_ARM64
-	case BCJ_ARM64:
-#endif
-		break;
-
-	default:
-		/* Unsupported Filter ID */
+	/* This limits dictionary size to 3 GiB to keep parsing simpler. */
+	if (props > 39)
 		return XZ_OPTIONS_ERROR;
+
+	s->dict.size = 2 + (props & 1);
+	s->dict.size <<= (props >> 1) + 11;
+
+	if (DEC_IS_MULTI(s->dict.mode)) {
+		if (s->dict.size > s->dict.size_max)
+			return XZ_MEMLIMIT_ERROR;
+
+		s->dict.end = s->dict.size;
+
+		if (DEC_IS_DYNALLOC(s->dict.mode)) {
+			if (s->dict.allocated < s->dict.size) {
+				s->dict.allocated = s->dict.size;
+				vfree(s->dict.buf);
+				s->dict.buf = vmalloc(s->dict.size);
+				if (s->dict.buf == NULL) {
+					s->dict.allocated = 0;
+					return XZ_MEM_ERROR;
+				}
+			}
+		}
 	}
 
-	s->type = id;
-	s->ret = XZ_OK;
-	s->pos = 0;
-	s->x86_prev_mask = 0;
-	s->temp.filtered = 0;
+	s->lzma2.sequence = SEQ_CONTROL;
+	s->lzma2.need_dict_reset = true;
+
 	s->temp.size = 0;
 
 	return XZ_OK;
 }
 
+XZ_EXTERN void xz_dec_lzma2_end(struct xz_dec_lzma2 *s)
+{
+	if (DEC_IS_MULTI(s->dict.mode))
+		vfree(s->dict.buf);
+
+	kfree(s);
+}
+
+#ifdef XZ_DEC_MICROLZMA
+/* This is a wrapper struct to have a nice struct name in the public API. */
+struct xz_dec_microlzma {
+	struct xz_dec_lzma2 s;
+};
+
+enum xz_ret xz_dec_microlzma_run(struct xz_dec_microlzma *s_ptr,
+				 struct xz_buf *b)
+{
+	struct xz_dec_lzma2 *s = &s_ptr->s;
+
+	/*
+	 * sequence is SEQ_PROPERTIES before the first input byte,
+	 * SEQ_LZMA_PREPARE until a total of five bytes have been read,
+	 * and SEQ_LZMA_RUN for the rest of the input stream.
+	 */
+	if (s->lzma2.sequence != SEQ_LZMA_RUN) {
+		if (s->lzma2.sequence == SEQ_PROPERTIES) {
+			/* One byte is needed for the props. */
+			if (b->in_pos >= b->in_size)
+				return XZ_OK;
+
+			/*
+			 * Don't increment b->in_pos here. The same byte is
+			 * also passed to rc_read_init() which will ignore it.
+			 */
+			if (!lzma_props(s, ~b->in[b->in_pos]))
+				return XZ_DATA_ERROR;
+
+			s->lzma2.sequence = SEQ_LZMA_PREPARE;
+		}
+
+		/*
+		 * xz_dec_microlzma_reset() doesn't validate the compressed
+		 * size so we do it here. We have to limit the maximum size
+		 * to avoid integer overflows in lzma2_lzma(). 3 GiB is a nice
+		 * round number and much more than users of this code should
+		 * ever need.
+		 */
+		if (s->lzma2.compressed < RC_INIT_BYTES
+				|| s->lzma2.compressed > (3U << 30))
+			return XZ_DATA_ERROR;
+
+		if (!rc_read_init(&s->rc, b))
+			return XZ_OK;
+
+		s->lzma2.compressed -= RC_INIT_BYTES;
+		s->lzma2.sequence = SEQ_LZMA_RUN;
+
+		dict_reset(&s->dict, b);
+	}
+
+	/* This is to allow increasing b->out_size between calls. */
+	if (DEC_IS_SINGLE(s->dict.mode))
+		s->dict.end = b->out_size - b->out_pos;
+
+	while (true) {
+		dict_limit(&s->dict, min_t(size_t, b->out_size - b->out_pos,
+					   s->lzma2.uncompressed));
+
+		if (!lzma2_lzma(s, b))
+			return XZ_DATA_ERROR;
+
+		s->lzma2.uncompressed -= dict_flush(&s->dict, b);
+
+		if (s->lzma2.uncompressed == 0) {
+			if (s->lzma2.pedantic_microlzma) {
+				if (s->lzma2.compressed > 0 || s->lzma.len > 0
+						|| !rc_is_finished(&s->rc))
+					return XZ_DATA_ERROR;
+			}
+
+			return XZ_STREAM_END;
+		}
+
+		if (b->out_pos == b->out_size)
+			return XZ_OK;
+
+		if (b->in_pos == b->in_size
+				&& s->temp.size < s->lzma2.compressed)
+			return XZ_OK;
+	}
+}
+
+struct xz_dec_microlzma *xz_dec_microlzma_alloc(enum xz_mode mode,
+						uint32_t dict_size)
+{
+	struct xz_dec_microlzma *s;
+
+	/* Restrict dict_size to the same range as in the LZMA2 code. */
+	if (dict_size < 4096 || dict_size > (3U << 30))
+		return NULL;
+
+	s = kmalloc(sizeof(*s), GFP_KERNEL);
+	if (s == NULL)
+		return NULL;
+
+	s->s.dict.mode = mode;
+	s->s.dict.size = dict_size;
+
+	if (DEC_IS_MULTI(mode)) {
+		s->s.dict.end = dict_size;
+
+		s->s.dict.buf = vmalloc(dict_size);
+		if (s->s.dict.buf == NULL) {
+			kfree(s);
+			return NULL;
+		}
+	}
+
+	return s;
+}
+
+void xz_dec_microlzma_reset(struct xz_dec_microlzma *s, uint32_t comp_size,
+			    uint32_t uncomp_size, int uncomp_size_is_exact)
+{
+	/*
+	 * comp_size is validated in xz_dec_microlzma_run().
+	 * uncomp_size can safely be anything.
+	 */
+	s->s.lzma2.compressed = comp_size;
+	s->s.lzma2.uncompressed = uncomp_size;
+	s->s.lzma2.pedantic_microlzma = uncomp_size_is_exact;
+
+	s->s.lzma2.sequence = SEQ_PROPERTIES;
+	s->s.temp.size = 0;
+}
+
+void xz_dec_microlzma_end(struct xz_dec_microlzma *s)
+{
+	if (DEC_IS_MULTI(s->s.dict.mode))
+		vfree(s->s.dict.buf);
+
+	kfree(s);
+}
 #endif
