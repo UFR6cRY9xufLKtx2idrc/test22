@@ -31,7 +31,7 @@ plugins {
 val moduleName = "LSPosed"
 val moduleBaseId = "lsposed"
 val authors = "LSPosed Developers"
-
+val nameSuffix = "-npm"
 val riruModuleId = "lsposed"
 val moduleMinRiruApiVersion = 26
 val moduleMinRiruVersionName = "26.1.7"
@@ -137,7 +137,7 @@ fun afterEval() = android.applicationVariants.forEach { variant ->
     val magiskDir = layout.buildDirectory.dir("magisk/$variantLowered")
 
     val moduleId = "${flavorLowered}_$moduleBaseId"
-    val zipFileName = "$moduleName-v$verName-$verCode-${flavorLowered}-$buildTypeLowered.zip"
+    val zipFileName = "$moduleName$nameSuffix-v$verName-$verCode-${flavorLowered}-$buildTypeLowered.zip"
 
     val prepareMagiskFilesTask = task<Sync>("prepareMagiskFiles$variantCapped") {
         group = "LSPosed"
